@@ -31,7 +31,7 @@ main{max-width:1390px;margin:auto;padding:22px 24px}.top{display:flex;justify-co
 <div class="control"><span class="label">Caleb AI style</span><select id="mode"><option value="average">Average Caleb</option><option value="peak">Peak Caleb</option></select></div>
 </div>
 <div class="engine"><span class="dot" id="engineDot"></span><span id="engineStatus">Stockfish engine is starting…</span></div>
-<p class="note">Select a piece and then a highlighted square. Pawn promotions automatically choose a queen. Average Caleb favors his recorded decisions and typical patterns; Peak Caleb favors the strongest engine candidate while retaining a small amount of Caleb’s historical style.</p>
+<p class="note">Select a piece and then a highlighted square. Pawn promotions automatically choose a queen. Both modes use Stockfish to check tactics. Average Caleb chooses among near-equal safe moves using patterns from Caleb’s PGNs; Peak Caleb chooses the engine’s top move.</p>
 </section>
 <aside class="panel">
 <h2 style="margin:0 0 7px;font-size:19px">Caleb’s profile</h2>
@@ -44,7 +44,7 @@ main{max-width:1390px;margin:auto;padding:22px 24px}.top{display:flex;justify-co
 <h3 class="sectiontitle">Move history</h3><div class="moves" id="moves">Your game moves will appear here.</div>
 <h3 class="sectiontitle">Caleb's last decision</h3><div class="decision" id="decision">Waiting for Caleb AI to make a move.</div>
 <h3 class="sectiontitle">How the bot works</h3>
-<p class="note">• Average Caleb reuses legal moves from matching positions in the PGNs and otherwise samples from engine candidates using Caleb’s move patterns.<br><br>• Peak Caleb searches deeper and chooses the top engine candidate, with a small style adjustment based on Caleb’s games.</p>
+<p class="note">• Average Caleb searches for tactics first, then varies among moves close to the engine’s best choice using Caleb’s historical patterns.<br><br>• Peak Caleb searches deeper and chooses the engine’s top move. Historical moves never override a clearly better tactical move.</p>
 <p class="footer">Style imitation is not a neural network trained from scratch. Its strength is not officially calibrated to a Chess.com rating; the “average” setting is intended to approximate Caleb's typical historical play, not guarantee a particular Elo.</p>
 </aside></div>
 </main>
@@ -96,22 +96,26 @@ function trainFromPGN(){
  $("whiteGames").textContent=training.white;$("blackGames").textContent=training.black;
  $("trainingBadge").textContent=training.games+" Caleb games loaded";
 }
-function historicalChoice(){
- const fen=game.fen(), exact=training.positions.get(fenKey(fen));
+function historicalMoveCounts(){
+ const fen=game.fen(),exact=training.positions.get(fenKey(fen));
  const map=exact||training.boardPositions.get(boardKey(fen));
- if(!map)return null;
+ return map||new Map();
+}
+function historicalChoice(){
+ const map=historicalMoveCounts();
  const legal=game.moves();
  const available=[...map.entries()].filter(([san])=>legal.includes(san)).sort((a,b)=>b[1]-a[1]);
  if(!available.length)return null;
- // Prefer the most common historical move, with a little variation among near-ties.
  const max=available[0][1],near=available.filter(x=>x[1]>=max-1);
  const pick=near[Math.floor(Math.random()*near.length)];
- return {san:pick[0],source:exact?"same historical position":"same board layout",count:pick[1]};
+ return {san:pick[0],source:"same historical position",count:pick[1]};
 }
 function styleBonus(move){
+ // Keep this deliberately modest: historical tendencies should shape safe choices,
+ // not overpower the engine's tactical evaluation.
  const feats=moveFeatures(move);let score=0;
- for(const f of feats){const n=training.features[f]||0;score+=Math.log(1+n)/Math.log(1+Math.max(1,training.positionCount))*28;}
- return score;
+ for(const f of feats){const n=training.features[f]||0;score+=Math.log(1+n)/Math.log(1+Math.max(1,training.positionCount))*2.0;}
+ return Math.min(10,score);
 }
 function createEngine(){
  try{
@@ -143,13 +147,13 @@ function handleEngineLine(line){
   if(resolve)resolve(engineCandidates.filter(Boolean));
  }
 }
-function askEngine(fen, depth=8){
+function askEngine(fen, depth=11){
  return new Promise(resolve=>{
   if(!engineReady||!engine||engineBusy){resolve([]);return}
   engineBusy=true;engineCandidates=[];engineResolve=resolve;
   engine.postMessage("position fen "+fen);
   engine.postMessage("go depth "+depth);
-  setTimeout(()=>{if(engineResolve===resolve){engine.postMessage("stop");}},7000);
+  setTimeout(()=>{if(engineResolve===resolve){engine.postMessage("stop");}},15000);
  });
 }
 function uciToMove(uci){
@@ -160,38 +164,50 @@ function uciToMove(uci){
 function chooseEngineCandidate(candidates, peak=false){
  if(!candidates.length)return null;
  const legal=game.moves({verbose:true}),options=[];
+ const history=historicalMoveCounts();
  for(const c of candidates){
   const from=c.pv.slice(0,2),to=c.pv.slice(2,4),promotion=c.pv[4];
   const m=legal.find(x=>x.from===from&&x.to===to&&(!promotion||x.promotion===promotion));
-  if(m)options.push({m,score:c.score+styleBonus(m),depth:c.depth});
+  if(!m)continue;
+  const san=m.san;
+  const historicalCount=history.get(san)||0;
+  const style=styleBonus(m)+(historicalCount?Math.min(24,8+historicalCount*4):0);
+  options.push({m,score:c.score,adjusted:c.score+style,depth:c.depth,historicalCount});
  }
  if(!options.length)return null;
+ // UCI scores are from the side-to-move's perspective. Never let the style model
+ // select a move that is far worse than the engine's best available candidate.
  options.sort((a,b)=>b.score-a.score);
- // Peak mode takes the strongest engine line; Average mode deliberately varies among candidates.
  if(peak)return options[0];
- const best=options[0].score,temp=760;
- const weighted=options.map(o=>({o,w:Math.exp(Math.max(-12,(o.score-best)/temp))}));
- const total=weighted.reduce((s,x)=>s+x.w,0);let r=Math.random()*total;
+ const best=options[0].score;
+ const safe=options.filter(o=>o.score>=best-130);
+ safe.sort((a,b)=>b.adjusted-a.adjusted);
+ // A little variation among near-equal moves, but no wild 700cp swings.
+ const top=safe[0].adjusted;
+ const weighted=safe.map(o=>({o,w:Math.exp(Math.max(-8,(o.adjusted-top)/48))}));
+ const total=weighted.reduce((sum,x)=>sum+x.w,0);let r=Math.random()*total;
  for(const x of weighted){r-=x.w;if(r<=0)return x.o}
  return weighted[weighted.length-1].o;
 }
 async function chooseBotMove(){
  const peak=$("mode").value==="peak";
- // Average mode gives recorded Caleb decisions priority when the same position appears.
- if(!peak){const hist=historicalChoice();if(hist)return {...hist,source:"Average Caleb · "+hist.source};}
- const candidates=await askEngine(game.fen(),peak?13:8);
+ // Both modes consult Stockfish first. Historical moves only influence the choice
+ // when they are also among the engine's tactically reasonable candidates.
+ const candidates=await askEngine(game.fen(),peak?16:11);
  const selected=chooseEngineCandidate(candidates,peak);
  if(selected){
   const m=selected.m;
-  return {uci:m.from+m.to+(m.promotion||""),source:peak?"Peak Caleb · strongest Stockfish candidate with Caleb-style weighting":"Average Caleb · Stockfish candidates + Caleb move-pattern profile",depth:selected.depth};
+  return {uci:m.from+m.to+(m.promotion||""),source:peak?"Peak Caleb · strongest engine candidate":"Average Caleb · safe engine candidates weighted by Caleb's historical style",depth:selected.depth,count:selected.historicalCount||0};
  }
- // If the engine is unavailable, keep play legal and use the PGN-derived style profile.
- const hist=historicalChoice();if(hist)return {...hist,source:(peak?"Peak fallback · ":"Average Caleb · ")+hist.source};
+ // If Stockfish is unavailable, use an actual legal historical decision when possible.
+ const hist=historicalChoice();if(hist)return {...hist,source:(peak?"Peak fallback · ":"Average fallback · ")+hist.source};
  const all=game.moves({verbose:true});
  if(!all.length)return null;
- all.sort((a,b)=>styleBonus(b)-styleBonus(a));
- const pool=all.slice(0,peak?1:Math.min(5,all.length));
- return {fallback:pool[Math.floor(Math.random()*pool.length)],source:peak?"Peak Caleb fallback · best style-scored legal move":"Average Caleb fallback · style-based move"};
+ // Without an engine, prefer forcing moves/captures as a simple fallback, but this
+ // is explicitly weaker than engine-backed play and cannot reliably see tactics.
+ all.sort((a,b)=>((b.captured?1:0)+(b.san.includes("+")?1:0)+(b.san.includes("#")?2:0))-((a.captured?1:0)+(a.san.includes("+")?1:0)+(a.san.includes("#")?2:0)));
+ const pool=all.slice(0,Math.min(5,all.length));
+ return {fallback:pool[Math.floor(Math.random()*pool.length)],source:"Engine unavailable · basic legal-move fallback"};
 }
 async function botTurn(){
  if(!game||game.game_over()||game.turn()!==bot||thinking)return;
@@ -202,7 +218,7 @@ async function botTurn(){
  if(result.san)moved=game.move(result.san);
  else if(result.uci)moved=uciToMove(result.uci);
  else if(result.fallback)moved=game.move({from:result.fallback.from,to:result.fallback.to,promotion:result.fallback.promotion||"q"});
- if(moved){lastMove={from:moved.from,to:moved.to};$("decision").textContent=result.source+(result.count?" · Caleb played this move "+result.count+" time(s) in matching positions.":result.depth?" · Stockfish depth "+result.depth+" with Caleb-style move weighting.":" · A legal style-based fallback was used.");}
+ if(moved){lastMove={from:moved.from,to:moved.to};$("decision").textContent=result.source+(result.count?" · This move also appears in Caleb’s PGN history ("+result.count+" match(es)).":result.depth?" · Stockfish depth "+result.depth+" with Caleb-style move weighting.":" · A legal style-based fallback was used.");}
  thinking=false;selected=null;targets=[];render();
 }
 function clickSquare(sq){
